@@ -23,22 +23,27 @@ Edge: A road segment from point P1 to point P2
      (start)    edge     (end)
         │                  │
         ▼                  ▼
-  incoming_cell      outgoing_cell
+  outgoing_cell      incoming_cell
 ```
+
+> [!IMPORTANT]
+> **Cell Naming Convention**
+> - `incoming_cell` = where edge **ENDS** (the cell you're entering)
+> - `outgoing_cell` = where edge **STARTS** (the cell you're leaving)
 
 ### Definitions
 
 | Term | Definition |
 |------|------------|
-| **incoming_cell** | The H3 cell where the edge **STARTS** (entry point) |
-| **outgoing_cell** | The H3 cell where the edge **ENDS** (exit point) |
+| **incoming_cell** | The H3 cell where the edge **ENDS** |
+| **outgoing_cell** | The H3 cell where the edge **STARTS** |
 | **incoming_edge** | In a shortcut A→B, edge A is the incoming edge |
 | **outgoing_edge** | In a shortcut A→B, edge B is the outgoing edge |
 
 ### Direct Connection Rule
 
 For shortcut (A, B) to be **direct** (A connects directly to B):
-- `A.outgoing_cell == B.incoming_cell` → Edge A ends where Edge B starts
+- `A.incoming_cell == B.outgoing_cell` → Edge A ends where Edge B starts
 
 ### Example
 
