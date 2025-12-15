@@ -1,0 +1,1 @@
+# Shortcuts Generation Package

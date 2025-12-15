@@ -1,0 +1,41 @@
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Spark
+*.jar
+metastore_db/
+spark-warehouse/
+
+# Output/Data
+output/
+logs/
+checkpoints/
+*.parquet
+*.csv.gz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+data
