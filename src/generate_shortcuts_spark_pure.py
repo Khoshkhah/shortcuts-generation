@@ -42,7 +42,7 @@ def has_converged(current_paths: DataFrame, next_paths: DataFrame) -> bool:
     
     Convergence occurs when no new paths or path improvements are found.
     """
-    join_keys = ["incoming_edge", "outgoing_edge", "cost", "current_cell"]
+    join_keys = ["from_edge", "to_edge", "cost", "current_cell"]
     
     # Find rows in next_paths that don't exist in current_paths
     changes = next_paths.join(
@@ -63,7 +63,7 @@ def compute_shortest_paths_pure_spark(
     Compute all-pairs shortest paths using pure Spark SQL operations.
     
     Uses self-joins and window functions to iteratively extend paths until
-    convergence.
+    convergence (no new paths and no cost improvements).
     
     Args:
         shortcuts_df: Input shortcuts DataFrame with current_cell column
@@ -77,49 +77,45 @@ def compute_shortest_paths_pure_spark(
     
     # Initialize
     current_paths = shortcuts_df.select(
-        "incoming_edge", "outgoing_edge", "cost", "via_edge", "current_cell"
+        "from_edge", "to_edge", "cost", "via_edge", "current_cell"
     ).cache()
     
-    initial_count = current_paths.count()
-    logger.info(f"Initial paths count: {initial_count}")
+    # Get initial stats
+    stats = current_paths.agg(
+        F.count("*").alias("count"),
+        F.sum("cost").alias("cost_sum")
+    ).collect()[0]
+    prev_count = stats["count"]
+    prev_cost_sum = stats["cost_sum"] if stats["cost_sum"] is not None else 0.0
+    
+    logger.info(f"Initial: {prev_count} paths, CostSum: {prev_cost_sum:.4f}")
     
     for iteration in range(max_iterations):
-        logger.info(f"--- Iteration {iteration} ---")
-        
         try:
             # --- PATH EXTENSION via self-join ---
             new_paths = current_paths.alias("L").join(
                 current_paths.alias("R"),
                 [
-                    F.col("L.outgoing_edge") == F.col("R.incoming_edge"),
+                    F.col("L.to_edge") == F.col("R.from_edge"),
                     F.col("L.current_cell") == F.col("R.current_cell")
                 ],
                 "inner"
             ).filter(
-                (F.col("L.incoming_edge") != F.col("R.outgoing_edge"))
+                (F.col("L.from_edge") != F.col("R.to_edge"))
             ).select(
-                F.col("L.incoming_edge").alias("incoming_edge"),
-                F.col("R.outgoing_edge").alias("outgoing_edge"),
+                F.col("L.from_edge").alias("from_edge"),
+                F.col("R.to_edge").alias("to_edge"),
                 (F.col("L.cost") + F.col("R.cost")).alias("cost"),
-                F.col("L.outgoing_edge").alias("via_edge"),
+                F.col("L.to_edge").alias("via_edge"),
                 F.col("L.current_cell").alias("current_cell")
             ).cache()
-            
-            new_count = new_paths.count()
-            logger.info(f"Found {new_count} new paths")
-            
-            # Check if any new paths were found
-            if new_count == 0:
-                logger.info("✓ No new paths found. Converged.")
-                new_paths.unpersist()
-                break
             
             # --- COST MINIMIZATION using window function ---
             all_paths = current_paths.unionByName(new_paths)
             
             window_spec = Window.partitionBy(
-                "incoming_edge",
-                "outgoing_edge",
+                "from_edge",
+                "to_edge",
                 "current_cell"
             ).orderBy(
                 F.col("cost").asc(),
@@ -133,22 +129,31 @@ def compute_shortest_paths_pure_spark(
                 F.col("rnk") == 1
             ).drop("rnk").localCheckpoint()
             
-            next_count = next_paths.count()
-            logger.info(f"After cost minimization: {next_count} paths")
+            # --- GET STATS FOR CONVERGENCE CHECK ---
+            stats = next_paths.agg(
+                F.count("*").alias("count"),
+                F.sum("cost").alias("cost_sum")
+            ).collect()[0]
+            curr_count = stats["count"]
+            curr_cost_sum = stats["cost_sum"] if stats["cost_sum"] is not None else 0.0
+            
+            cost_diff = prev_cost_sum - curr_cost_sum  # Positive = improvement
+            
+            logger.info(f"Iteration {iteration}: Rows {prev_count} -> {curr_count}, CostSum {prev_cost_sum:.4f} -> {curr_cost_sum:.4f} (diff: {cost_diff:.4f})")
             
             # Clean up
             current_paths.unpersist()
             new_paths.unpersist()
             
-            # --- CONVERGENCE CHECK ---
-            if next_count == initial_count and has_converged(current_paths, next_paths):
-                logger.info(f"✓ Iteration {iteration}: Converged - no improvements found!")
+            # --- CONVERGENCE CHECK: Same count AND no cost improvement ---
+            if curr_count == prev_count and abs(cost_diff) < 1e-6:
+                logger.info("Converged.")
                 current_paths = next_paths
                 break
             
             current_paths = next_paths
-            initial_count = next_count
-            logger.info(f"✓ Iteration {iteration}: Completed successfully")
+            prev_count = curr_count
+            prev_cost_sum = curr_cost_sum
             
         except Exception as e:
             logger.error(f"Error in iteration {iteration}: {str(e)}")
@@ -302,7 +307,7 @@ def main(max_iterations: int = 10):
         logger.info("Adding final info (cell, inside)...")
         final_df = add_final_info(shortcuts_df, edges_df)
         
-        output_path = str(config.SHORTCUTS_OUTPUT_FILE).replace("_shortcuts", "_shortcuts_spark")
+        output_path = str(config.SHORTCUTS_OUTPUT_FILE).replace("_shortcuts", "_spark_pure")
         logger.info(f"Saving to: {output_path}")
         final_df.write.mode("overwrite").parquet(output_path)
         logger.info("✓ Saved successfully!")

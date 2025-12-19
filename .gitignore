@@ -39,3 +39,6 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 data
+
+# Temp
+.tmp/

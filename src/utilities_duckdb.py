@@ -1,0 +1,301 @@
+
+import duckdb
+import h3
+import config
+
+def initialize_duckdb(db_path: str = ":memory:") -> duckdb.DuckDBPyConnection:
+    """Initialize DuckDB connection and register UDFs."""
+    con = duckdb.connect(db_path)
+    
+    # Register H3 UDFs
+    con.create_function("h3_lca", _find_lca_impl, ["BIGINT", "BIGINT"], "BIGINT")
+    con.create_function("h3_resolution", _find_resolution_impl, ["BIGINT"], "INTEGER")
+    con.create_function("h3_parent", _get_parent_cell_impl, ["BIGINT", "INTEGER"], "BIGINT")
+    
+    return con
+
+# ============================================================================
+# H3 IMPLEMENTATIONS (Pure Python)
+# ============================================================================
+
+def _find_lca_impl(cell1: int, cell2: int) -> int:
+    """Find the LCA of two H3 cells."""
+    if cell1 == 0 or cell2 == 0:
+        return 0
+    try:
+        cell1_str = h3.int_to_str(cell1)
+        cell2_str = h3.int_to_str(cell2)
+        min_res = min(h3.get_resolution(cell1_str), h3.get_resolution(cell2_str))
+        for res in range(min_res, -1, -1):
+            p1 = h3.cell_to_parent(cell1_str, res)
+            p2 = h3.cell_to_parent(cell2_str, res)
+            if p1 == p2:
+                return h3.str_to_int(p1)
+    except:
+        pass
+    return 0
+
+def _find_resolution_impl(cell: int) -> int:
+    """Get resolution of an H3 cell."""
+    if cell == 0:
+        return -1
+    try:
+        return h3.get_resolution(h3.int_to_str(cell))
+    except:
+        return -1
+
+def _get_parent_cell_impl(cell: int, target_res: int) -> int:
+    """Get parent cell at target resolution."""
+    if cell == 0 or target_res < 0:
+        return 0
+    try:
+        cell_str = h3.int_to_str(cell)
+        cell_res = h3.get_resolution(cell_str)
+        if target_res > cell_res:
+            return cell
+        return h3.str_to_int(h3.cell_to_parent(cell_str, target_res))
+    except:
+        return 0
+
+# ============================================================================
+# DATA OPERATIONS
+# ============================================================================
+
+def read_edges(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
+    """Load edges into 'edges' table."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE edges AS 
+        SELECT id, from_cell, to_cell, lca_res 
+        FROM read_csv_auto('{file_path}')
+    """)
+
+def create_edges_cost_table(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
+    """Load edges with cost calculation into 'edges_cost' table."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE edges_cost AS 
+        SELECT 
+            id,
+            CASE 
+                WHEN maxspeed <= 0 THEN 1e308 
+                ELSE length / maxspeed 
+            END AS cost
+        FROM read_csv_auto('{file_path}')
+    """)
+
+def initial_shortcuts_table(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
+    """Create 'shortcuts' table from edge graph and edge costs."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE shortcuts AS
+        SELECT 
+            g.from_edge,
+            g.to_edge,
+            c.cost,
+            g.to_edge AS via_edge
+        FROM read_csv_auto('{file_path}') g
+        LEFT JOIN edges_cost c ON g.from_edge = c.id
+    """)
+
+def assign_cell_forward(con: duckdb.DuckDBPyConnection, current_res: int) -> None:
+    """
+    Update 'shortcuts' table with 'current_cell' for FORWARD pass.
+    Creates 'shortcuts_next' with valid assignments.
+    
+    MATCHES SPARK: Returns UNION of inner_cell AND outer_cell assignments.
+    Shortcuts valid for both will appear twice with different cells.
+    """
+    con.execute(f"""
+        CREATE OR REPLACE TABLE shortcuts_next AS
+        WITH calculated AS (
+            SELECT 
+                s.*,
+                -- Join A (incoming)
+                e1.to_cell AS a_to, 
+                e1.from_cell AS a_from, 
+                e1.lca_res AS lca_in,
+                -- Join B (outgoing)
+                e2.to_cell AS b_to, 
+                e2.from_cell AS b_from, 
+                e2.lca_res AS lca_out,
+                -- Computations
+                GREATEST(e1.lca_res, e2.lca_res) AS lca_res,
+                h3_lca(e1.to_cell, e2.from_cell) AS inner_cell,
+                h3_lca(e1.from_cell, e2.to_cell) AS outer_cell
+            FROM shortcuts s
+            LEFT JOIN edges e1 ON s.from_edge = e1.id
+            LEFT JOIN edges e2 ON s.to_edge = e2.id
+        ),
+        resolutions AS (
+            SELECT 
+                *,
+                h3_resolution(inner_cell) AS inner_res,
+                h3_resolution(outer_cell) AS outer_res
+            FROM calculated
+        ),
+        -- Part 1: Assign to INNER_CELL
+        -- Valid when: lca_res <= current_res AND inner_res >= current_res
+        inner_assignments AS (
+            SELECT 
+                from_edge, to_edge, cost, via_edge,
+                CASE 
+                    WHEN inner_res < {current_res} THEN h3_parent(a_from, {current_res})
+                    ELSE h3_parent(inner_cell, {current_res})
+                END AS current_cell
+            FROM resolutions
+            WHERE lca_res <= {current_res} AND inner_res >= {current_res}
+        ),
+        -- Part 2: Assign to OUTER_CELL
+        -- Valid when: lca_res <= current_res AND outer_res >= current_res
+        outer_assignments AS (
+            SELECT 
+                from_edge, to_edge, cost, via_edge,
+                CASE 
+                    WHEN outer_res < {current_res} THEN h3_parent(a_from, {current_res})
+                    ELSE h3_parent(outer_cell, {current_res})
+                END AS current_cell
+            FROM resolutions
+            WHERE lca_res <= {current_res} AND outer_res >= {current_res}
+        )
+        -- Union both (shortcuts valid for both will appear twice with different cells)
+        SELECT * FROM inner_assignments
+        UNION ALL
+        SELECT * FROM outer_assignments
+    """)
+
+def assign_cell_backward(con: duckdb.DuckDBPyConnection, current_res: int) -> None:
+    """
+    Update 'shortcuts' table with 'current_cell' for BACKWARD pass.
+    
+    Key difference from forward:
+    - Assigns shortcuts to BOTH inner_cell AND outer_cell (UNION)
+    - Filters: lca_res <= current_res AND (inner_res >= current_res OR outer_res >= current_res)
+    """
+    con.execute(f"""
+        CREATE OR REPLACE TABLE shortcuts_next AS
+        WITH calculated AS (
+            SELECT 
+                s.*,
+                e1.to_cell AS a_to, 
+                e1.from_cell AS a_from, 
+                e1.lca_res AS lca_in,
+                e2.to_cell AS b_to, 
+                e2.from_cell AS b_from, 
+                e2.lca_res AS lca_out,
+                GREATEST(e1.lca_res, e2.lca_res) AS lca_res,
+                h3_lca(e1.to_cell, e2.from_cell) AS inner_cell,
+                h3_lca(e1.from_cell, e2.to_cell) AS outer_cell
+            FROM shortcuts s
+            LEFT JOIN edges e1 ON s.from_edge = e1.id
+            LEFT JOIN edges e2 ON s.to_edge = e2.id
+        ),
+        resolutions AS (
+            SELECT 
+                *,
+                h3_resolution(inner_cell) AS inner_res,
+                h3_resolution(outer_cell) AS outer_res
+            FROM calculated
+        ),
+        -- Part 1: Assign to INNER_CELL
+        -- Valid when: lca_res <= current_res AND inner_res >= current_res
+        inner_assignments AS (
+            SELECT 
+                from_edge, to_edge, cost, via_edge,
+                CASE 
+                    WHEN inner_res < {current_res} THEN h3_parent(a_from, {current_res})
+                    ELSE h3_parent(inner_cell, {current_res})
+                END AS current_cell
+            FROM resolutions
+            WHERE lca_res <= {current_res} AND inner_res >= {current_res}
+        ),
+        -- Part 2: Assign to OUTER_CELL  
+        -- Valid when: lca_res <= current_res AND outer_res >= current_res
+        outer_assignments AS (
+            SELECT 
+                from_edge, to_edge, cost, via_edge,
+                CASE 
+                    WHEN outer_res < {current_res} THEN h3_parent(a_from, {current_res})
+                    ELSE h3_parent(outer_cell, {current_res})
+                END AS current_cell
+            FROM resolutions
+            WHERE lca_res <= {current_res} AND outer_res >= {current_res}
+        )
+        -- Union both (shortcuts valid for both will appear twice with different cells)
+        SELECT * FROM inner_assignments
+        UNION ALL
+        SELECT * FROM outer_assignments
+    """)
+
+def merge_shortcuts(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Merge 'shortcuts_next' into 'shortcuts', keeping min cost.
+    Result is stored back in 'shortcuts'.
+    
+    MATCHES SPARK: Uses window function with ORDER BY (cost, via_edge) for tie-breaking.
+    """
+    con.execute("""
+        CREATE OR REPLACE TABLE shortcuts_merged AS
+        SELECT from_edge, to_edge, cost, via_edge FROM shortcuts
+        UNION ALL
+        SELECT from_edge, to_edge, cost, via_edge FROM shortcuts_next
+    """)
+    
+    # Use window function with ORDER BY (cost, via_edge) same as Spark
+    con.execute("""
+        CREATE OR REPLACE TABLE shortcuts AS
+        SELECT from_edge, to_edge, cost, via_edge 
+        FROM (
+            SELECT 
+                from_edge, 
+                to_edge, 
+                cost, 
+                via_edge,
+                ROW_NUMBER() OVER (
+                    PARTITION BY from_edge, to_edge 
+                    ORDER BY cost ASC, via_edge ASC
+                ) as rank
+            FROM shortcuts_merged
+        )
+        WHERE rank = 1
+    """)
+    
+    con.execute("DROP TABLE shortcuts_merged")
+    con.execute("DROP TABLE shortcuts_next")
+
+def add_final_info(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Finalize 'shortcuts' table: add 'cell' and 'inside'.
+    Filters invalid shortcuts.
+    """
+    con.execute("""
+        CREATE OR REPLACE TABLE shortcuts_final AS
+        WITH calculated AS (
+            SELECT 
+                s.*,
+                e1.lca_res AS lca_in,
+                e2.lca_res AS lca_out,
+                GREATEST(e1.lca_res, e2.lca_res) AS lca_res,
+                h3_resolution(h3_lca(e1.to_cell, e2.from_cell)) AS inner_res,
+                h3_lca(e1.from_cell, e2.to_cell) AS outer_cell,
+                h3_resolution(h3_lca(e1.from_cell, e2.to_cell)) AS outer_res
+            FROM shortcuts s
+            LEFT JOIN edges e1 ON s.from_edge = e1.id
+            LEFT JOIN edges e2 ON s.to_edge = e2.id
+        )
+        SELECT 
+            from_edge, to_edge, cost, via_edge,
+            CASE 
+                WHEN lca_res > inner_res THEN -2 -- outer-only
+                WHEN lca_in = lca_out THEN 0     -- lateral
+                WHEN lca_in < lca_out THEN -1    -- downward
+                ELSE 1                           -- upward
+            END AS inside,
+            h3_parent(outer_cell, CAST(LEAST(lca_in, lca_out) AS INTEGER)) AS cell
+        FROM calculated
+        WHERE lca_res <= inner_res OR lca_res <= outer_res
+    """)
+    
+    con.execute("CREATE OR REPLACE TABLE shortcuts AS SELECT * FROM shortcuts_final")
+    con.execute("DROP TABLE shortcuts_final")
+
+def save_output(con: duckdb.DuckDBPyConnection, output_path: str) -> None:
+    """Save 'shortcuts' table to Parquet."""
+    con.execute(f"COPY shortcuts TO '{output_path}' (FORMAT PARQUET)")

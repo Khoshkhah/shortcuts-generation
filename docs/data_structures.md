@@ -11,8 +11,8 @@ The edges DataFrame contains road network segments with H3 spatial indexing.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | int | Unique edge identifier |
-| `incoming_cell` | long | H3 cell ID at the **end** point (resolution 15) |
-| `outgoing_cell` | long | H3 cell ID at the **start** point (resolution 15) |
+| `incoming_cell` | long | H3 cell ID at the start point (resolution 15) |
+| `outgoing_cell` | long | H3 cell ID at the end point (resolution 15) |
 | `lca_res` | int | Resolution of LCA between incoming and outgoing cells |
 | `length` | float | Edge length in meters |
 | `maxspeed` | float | Maximum speed in m/s |

@@ -66,18 +66,19 @@ def initialize_spark(app_name: str = "ShortcutsGeneration", driver_memory: str =
 def read_edges(spark: SparkSession, file_path: str) -> DataFrame:
     """Load edge data from CSV file."""
     edges_df = spark.read.csv(file_path, header=True, inferSchema=True)
-    return edges_df.select("id", "incoming_cell", "outgoing_cell", "lca_res")
+    return edges_df.select("id", "from_cell", "to_cell", "lca_res")
 
 
 def initial_shortcuts_table(spark: SparkSession, file_path: str, edges_cost_df: DataFrame) -> DataFrame:
     """Create initial shortcuts table from edge graph."""
     shortcuts_df = spark.read.csv(file_path, header=True, inferSchema=True)
-    shortcuts_df = shortcuts_df.select("incoming_edge", "outgoing_edge")
-    shortcuts_df = shortcuts_df.withColumn("via_edge", F.col("outgoing_edge"))
+    # Graph file has from_edge, to_edge
+    shortcuts_df = shortcuts_df.select("from_edge", "to_edge")
+    shortcuts_df = shortcuts_df.withColumn("via_edge", F.col("to_edge"))
     
     shortcuts_df = shortcuts_df.join(
         edges_cost_df.select("id", "cost"),
-        shortcuts_df.incoming_edge == edges_cost_df.id,
+        shortcuts_df.from_edge == edges_cost_df.id,
         "left"
     ).drop(edges_cost_df.id)
     
@@ -185,15 +186,15 @@ def assign_cell_forward(shortcuts_df: DataFrame, edges_df: DataFrame, current_re
             shortcuts_df = shortcuts_df.drop(col)
     
     # Join incoming edge info: A = (A.from -> A.to)
-    # CONVENTION: incoming_cell = A.to (where A ends), outgoing_cell = A.from (where A starts)
+    # CONVENTION: to_cell = A.to (where A ends), from_cell = A.from (where A starts)
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_in_id"),
-            F.col("incoming_cell").alias("a_to"),     # A.to = where A ends
-            F.col("outgoing_cell").alias("a_from"),   # A.from = where A starts
+            F.col("to_cell").alias("a_to"),     # A.to = where A ends
+            F.col("from_cell").alias("a_from"),   # A.from = where A starts
             F.col("lca_res").alias("lca_res_A")
         ),
-        shortcuts_df.incoming_edge == F.col("_in_id"),
+        shortcuts_df.from_edge == F.col("_in_id"),
         "left"
     ).drop("_in_id")
     
@@ -201,11 +202,11 @@ def assign_cell_forward(shortcuts_df: DataFrame, edges_df: DataFrame, current_re
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_out_id"),
-            F.col("incoming_cell").alias("b_to"),     # B.to = where B ends
-            F.col("outgoing_cell").alias("b_from"),   # B.from = where B starts
+            F.col("to_cell").alias("b_to"),     # B.to = where B ends
+            F.col("from_cell").alias("b_from"),   # B.from = where B starts
             F.col("lca_res").alias("lca_res_B")
         ),
-        shortcuts_df.outgoing_edge == F.col("_out_id"),
+        shortcuts_df.to_edge == F.col("_out_id"),
         "left"
     ).drop("_out_id")
     
@@ -298,15 +299,15 @@ def assign_cell_backward(shortcuts_df: DataFrame, edges_df: DataFrame, current_r
             shortcuts_df = shortcuts_df.drop(col)
     
     # Join incoming edge info: A = (A.from -> A.to)
-    # CONVENTION: incoming_cell = A.to (where A ends), outgoing_cell = A.from (where A starts)
+    # CONVENTION: to_cell = A.to (where A ends), from_cell = A.from (where A starts)
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_in_id"),
-            F.col("incoming_cell").alias("a_to"),     # A.to = where A ends
-            F.col("outgoing_cell").alias("a_from"),   # A.from = where A starts
+            F.col("to_cell").alias("a_to"),     # A.to = where A ends
+            F.col("from_cell").alias("a_from"),   # A.from = where A starts
             F.col("lca_res").alias("lca_res_A")
         ),
-        shortcuts_df.incoming_edge == F.col("_in_id"),
+        shortcuts_df.from_edge == F.col("_in_id"),
         "left"
     ).drop("_in_id")
     
@@ -314,11 +315,11 @@ def assign_cell_backward(shortcuts_df: DataFrame, edges_df: DataFrame, current_r
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_out_id"),
-            F.col("incoming_cell").alias("b_to"),     # B.to = where B ends
-            F.col("outgoing_cell").alias("b_from"),   # B.from = where B starts
+            F.col("to_cell").alias("b_to"),     # B.to = where B ends
+            F.col("from_cell").alias("b_from"),   # B.from = where B starts
             F.col("lca_res").alias("lca_res_B")
         ),
-        shortcuts_df.outgoing_edge == F.col("_out_id"),
+        shortcuts_df.to_edge == F.col("_out_id"),
         "left"
     ).drop("_out_id")
     
@@ -413,13 +414,13 @@ def merge_shortcuts(main_df: DataFrame, new_shortcuts: DataFrame) -> DataFrame:
         Updated DataFrame with best shortcuts
     """
     # Standardize columns
-    main_df = main_df.select("incoming_edge", "outgoing_edge", "cost", "via_edge")
-    new_shortcuts = new_shortcuts.select("incoming_edge", "outgoing_edge", "cost", "via_edge")
+    main_df = main_df.select("from_edge", "to_edge", "cost", "via_edge")
+    new_shortcuts = new_shortcuts.select("from_edge", "to_edge", "cost", "via_edge")
     
     combined = main_df.unionByName(new_shortcuts)
     
     # Keep minimum cost for each (source, target) pair
-    window_spec = Window.partitionBy("incoming_edge", "outgoing_edge").orderBy(F.col("cost").asc())
+    window_spec = Window.partitionBy("from_edge", "to_edge").orderBy(F.col("cost").asc())
     
     result = combined.withColumn(
         "rank", F.row_number().over(window_spec)
@@ -452,15 +453,15 @@ def add_final_info(shortcuts_df: DataFrame, edges_df: DataFrame) -> DataFrame:
         DataFrame with cell and inside columns, filtered to valid shortcuts
     """
     # Join incoming edge info: A = (A.from -> A.to)
-    # CONVENTION: incoming_cell = A.to (where A ends), outgoing_cell = A.from (where A starts)
+    # CONVENTION: to_cell = A.to (where A ends), from_cell = A.from (where A starts)
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_in_id"),
-            F.col("incoming_cell").alias("a_to"),     # A.to = where A ends
-            F.col("outgoing_cell").alias("a_from"),   # A.from = where A starts
+            F.col("to_cell").alias("a_to"),     # A.to = where A ends
+            F.col("from_cell").alias("a_from"),   # A.from = where A starts
             F.col("lca_res").alias("lca_in")
         ),
-        shortcuts_df.incoming_edge == F.col("_in_id"),
+        shortcuts_df.from_edge == F.col("_in_id"),
         "left"
     ).drop("_in_id")
     
@@ -468,11 +469,11 @@ def add_final_info(shortcuts_df: DataFrame, edges_df: DataFrame) -> DataFrame:
     shortcuts_df = shortcuts_df.join(
         edges_df.select(
             F.col("id").alias("_out_id"),
-            F.col("incoming_cell").alias("b_to"),     # B.to = where B ends
-            F.col("outgoing_cell").alias("b_from"),   # B.from = where B starts
+            F.col("to_cell").alias("b_to"),     # B.to = where B ends
+            F.col("from_cell").alias("b_from"),   # B.from = where B starts
             F.col("lca_res").alias("lca_out")
         ),
-        shortcuts_df.outgoing_edge == F.col("_out_id"),
+        shortcuts_df.to_edge == F.col("_out_id"),
         "left"
     ).drop("_out_id")
     
